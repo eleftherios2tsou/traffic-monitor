@@ -4,40 +4,38 @@ from ultralytics import YOLO
 
 # CONFIGURATION
 
-# Environment variable controlling whether the video window should appear
 SHOW_WINDOW = os.environ.get("SHOW_WINDOW", "true").lower() == "true"
 
-# Input and output paths
 VIDEO_PATH = "sample_traffic.mp4"
 OUTPUT_PATH = "outputs/processed_output.mp4"
 
-# Vehicle classes we want to monitor
-# YOLO detects many classes, but we filter only relevant motorway vehicles
 VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle"}
-
-# Minimum confidence threshold for detections
 CONFIDENCE_THRESHOLD = 0.4
+# TRUE VALUES
+GROUND_TRUTH = {
+    "car": 28,
+    "truck": 2,
+    "bus": 0,
+    "motorcycle": 0
+}
+# Horizontal counting line position
+LINE_Y = 250
 
 # LOAD MODEL
 
-# Load pretrained YOLOv8 model
-# yolov8n = nano version (small and fast)
 model = YOLO("yolov8n.pt")
 
-# VIDEO INPUT SETUP
+# VIDEO SETUP
 
 cap = cv2.VideoCapture(VIDEO_PATH)
 
-# Retrieve video properties
 frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fps = cap.get(cv2.CAP_PROP_FPS)
 
-# If FPS is not detected properly, use a fallback
 if fps == 0:
     fps = 20
 
-# Prepare video writer for output file
 out = cv2.VideoWriter(
     OUTPUT_PATH,
     cv2.VideoWriter_fourcc(*"mp4v"),
@@ -45,67 +43,125 @@ out = cv2.VideoWriter(
     (frame_width, frame_height)
 )
 
-print("Starting traffic analysis...")
+# TRACKING STATE
 
-# MAIN PROCESSING LOOP
+# Stores previous y-center position for each tracked object ID
+previous_positions = {}
+
+# Stores IDs already counted after crossing the line
+counted_ids = set()
+
+# Stores total unique counts by vehicle type
+crossing_counts = {
+    "car": 0,
+    "truck": 0,
+    "bus": 0,
+    "motorcycle": 0
+}
+
+print("Starting traffic analysis with tracking and line counting...")
+
+# MAIN LOOP
 
 while True:
-
-    # Read next frame
     ret, frame = cap.read()
-
-    # If video ended, exit loop
     if not ret:
         break
 
-    # Run YOLO object detection
-    results = model(frame, verbose=False)
+    # Run YOLO tracking instead of plain detection
+    results = model.track(frame, persist=True, verbose=False)
     result = results[0]
 
-    # Draw YOLO bounding boxes on frame
-    annotated_frame = result.plot()
+    annotated_frame = frame.copy()
 
-    # Initialize vehicle counters
-    counts = {vehicle: 0 for vehicle in VEHICLE_CLASSES}
-    total_vehicles = 0
+    # Draw counting line
+    cv2.line(
+        annotated_frame,
+        (0, LINE_Y),
+        (frame_width, LINE_Y),
+        (0, 255, 255),
+        2
+    )
 
-    # PROCESS DETECTIONS
+    # Current frame visible counts
+    visible_counts = {vehicle: 0 for vehicle in VEHICLE_CLASSES}
+    total_visible = 0
 
-    for box in result.boxes:
+    # If no detections, continue safely
+    if result.boxes is not None and result.boxes.id is not None:
+        boxes = result.boxes
+        track_ids = boxes.id.int().cpu().tolist()
 
-        confidence = float(box.conf[0])
+        for box, track_id in zip(boxes, track_ids):
+            confidence = float(box.conf[0])
+            if confidence < CONFIDENCE_THRESHOLD:
+                continue
 
-        # Ignore low confidence detections
-        if confidence < CONFIDENCE_THRESHOLD:
-            continue
+            class_id = int(box.cls[0])
+            class_name = model.names[class_id]
 
-        # Get predicted class
-        class_id = int(box.cls[0])
-        class_name = model.names[class_id]
+            if class_name not in VEHICLE_CLASSES:
+                continue
 
-        # Only count selected vehicle classes
-        if class_name in VEHICLE_CLASSES:
-            counts[class_name] += 1
-            total_vehicles += 1
+            visible_counts[class_name] += 1
+            total_visible += 1
 
-    # TRAFFIC DENSITY ESTIMATION
+            # Bounding box coordinates
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-    # Simple heuristic for traffic density
-    if total_vehicles < 5:
+            # Center point of the object
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+
+            # Draw bounding box
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            # Label with class + tracking ID
+            label = f"{class_name} ID:{track_id} {confidence:.2f}"
+            cv2.putText(
+                annotated_frame,
+                label,
+                (x1, max(y1 - 10, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                2
+            )
+
+            # Draw center point
+            cv2.circle(annotated_frame, (center_x, center_y), 4, (0, 0, 255), -1)
+
+            # Check whether the object crossed the line
+            if track_id in previous_positions:
+                prev_y = previous_positions[track_id]
+
+                crossed_downward = prev_y < LINE_Y <= center_y
+                crossed_upward = prev_y > LINE_Y >= center_y
+
+                # Count only once
+                if (crossed_downward or crossed_upward) and track_id not in counted_ids:
+                    counted_ids.add(track_id)
+                    crossing_counts[class_name] += 1
+
+            # Update latest center position
+            previous_positions[track_id] = center_y
+
+    # TRAFFIC DENSITY
+
+    if total_visible < 5:
         density = "LOW"
-    elif total_vehicles < 10:
+    elif total_visible < 12:
         density = "MEDIUM"
     else:
         density = "HIGH"
 
-    # DRAW ANALYTICS TEXT ON FRAME
+    # OVERLAY TEXT
 
     y = 30
 
-    # Total vehicles detected
     cv2.putText(
         annotated_frame,
-        f"Total vehicles: {total_vehicles}",
+        f"Visible vehicles: {total_visible}",
         (20, y),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
@@ -113,50 +169,50 @@ while True:
         2
     )
 
-    # Display count per vehicle type
     y += 35
+    cv2.putText(
+        annotated_frame,
+        f"Traffic density: {density}",
+        (20, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2
+    )
 
+    y += 40
+    cv2.putText(
+        annotated_frame,
+        "Crossing counts:",
+        (20, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 0),
+        2
+    )
+
+    y += 35
     for vehicle in ["car", "truck", "bus", "motorcycle"]:
-
         cv2.putText(
             annotated_frame,
-            f"{vehicle.capitalize()}: {counts[vehicle]}",
+            f"{vehicle.capitalize()}: {crossing_counts[vehicle]}",
             (20, y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (255, 255, 255),
             2
         )
-
         y += 30
 
-    # Traffic density label
-    cv2.putText(
-        annotated_frame,
-        f"Traffic density: {density}",
-        (20, y + 10),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (255, 255, 255),
-        2
-    )
-    # SAVE FRAME
-
+    # Save frame
     out.write(annotated_frame)
 
-
-    # DISPLAY FRAME (LOCAL MODE ONLY)
-
-
+    # Optional display
     if SHOW_WINDOW:
-
         cv2.imshow("Motorway Traffic Monitor", annotated_frame)
 
-        # Press ESC to exit
         if cv2.waitKey(1) & 0xFF == 27:
             break
-
-
 
 # CLEANUP
 
@@ -166,4 +222,37 @@ out.release()
 if SHOW_WINDOW:
     cv2.destroyAllWindows()
 
-print(f"Processing complete. Output saved to {OUTPUT_PATH}")
+print("Processing complete.")
+print(f"Output saved to: {OUTPUT_PATH}")
+print("Final crossing counts:", crossing_counts)
+print("\nEvaluation Summary")
+print("-" * 30)
+
+total_true = sum(GROUND_TRUTH.values())
+total_pred = sum(crossing_counts.values())
+
+correct_by_count = 0
+absolute_error = 0
+
+for vehicle in ["car", "truck", "bus", "motorcycle"]:
+    true_count = GROUND_TRUTH.get(vehicle, 0)
+    pred_count = crossing_counts.get(vehicle, 0)
+    error = pred_count - true_count
+    absolute_error += abs(error)
+
+    print(
+        f"{vehicle.capitalize():<12} | Ground Truth: {true_count:<3} | "
+        f"Predicted: {pred_count:<3} | Error: {error:+d}"
+    )
+
+    # crude overlap count for approximate correctness
+    correct_by_count += min(true_count, pred_count)
+
+classification_accuracy = correct_by_count / total_true if total_true > 0 else 0
+
+print("-" * 30)
+print(f"Total ground truth vehicles: {total_true}")
+print(f"Total predicted vehicles:    {total_pred}")
+print(f"Approx. correct by count:    {correct_by_count}")
+print(f"Approx. classification accuracy: {classification_accuracy:.2%}")
+print(f"Total absolute count error:  {absolute_error}")

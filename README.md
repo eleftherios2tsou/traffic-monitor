@@ -33,6 +33,30 @@ It was built as a learning project to explore object detection, computer vision 
 5. Estimate traffic density
 6. Save and display the annotated result
 
+## Evaluation
+
+A simple count-based evaluation was performed on a sample motorway video.
+
+### Ground Truth
+- Car: 28
+- Truck: 2
+- Bus: 0
+- Motorcycle: 0
+
+### Predicted Crossing Counts
+- Car: 28
+- Truck: 1
+- Bus: 1
+- Motorcycle: 0
+
+### Observations
+- All 30 vehicles were detected
+- One truck was misclassified as a bus
+- This indicates strong detection performance but a minor classification confusion between visually similar heavy vehicles
+
+### Note
+This project currently uses aggregate count-based evaluation rather than full object detection metrics such as mAP, since the sample video was not frame-by-frame annotated.
+
 ## Run Locally
 
 ```bash
